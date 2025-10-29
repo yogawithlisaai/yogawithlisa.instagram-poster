@@ -1,1 +1,5 @@
 requests>=2.32.0
+pandas
+instagrapi
+Pillow
+python-dotenv
