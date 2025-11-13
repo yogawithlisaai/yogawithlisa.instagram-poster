@@ -1,303 +1,260 @@
 #!/usr/bin/env python3
 """
-Instagram Auto Poster (CSV-driven) — NEXT-SCHEDULE MODE
+Post queued images to Instagram using the Instagram Graph API,
+reading from captions.csv.
 
-CSV supported (your current format is fine):
+Requirements:
+    pip install requests
 
-    date,image_url,Category,Post No,caption,posted
+Environment variables:
+    IG_USER_ID        -> your Instagram Business Account ID (1784...)
+    IG_ACCESS_TOKEN   -> your long-lived Instagram access token
 
-Also supported:
+Input file:
+    captions.csv in the same folder, with columns:
+        date,image_url,Category,Post No.,caption,posted,_to_post,
+        _date_parsed,posted_at,instagram_media_id,error
 
-    filename,caption,posted
-
-Posting rules (default):
-- **Next scheduled** post only. The script finds the earliest row with `posted` falsey
-  and a `date` ≥ today. If there are no future-dated rows, it falls back to the
-  earliest past-dated unposted row. If there is no `date` column, it posts the
-  first unposted row.
-- After success, marks `posted=TRUE`, records `posted_at` and `instagram_media_id`.
-
-Override:
-- `--all`  : post ALL matching rows (like the previous behavior).
-- `--limit N` works in both modes; in next-schedule mode it limits how many
-  consecutive “next” rows to post (usually 1).
-- `--dry-run` to simulate without uploading.
-- `--category …`, `--start-date …`, `--end-date …` still work.
-
-Auth:
-- Set environment variables IG_USERNAME and IG_PASSWORD.
-- Session cached in `.ig_session.json`.
-
-Examples:
-    # Post today’s (or next) scheduled item only
-    python3 post_to_instagram.py
-
-    # Post two upcoming scheduled items
-    python3 post_to_instagram.py --limit 2
-
-    # Old behavior (post everything unposted)
-    python3 post_to_instagram.py --all
-
+Usage:
+    python post_to_instagram.py --limit 1
+    python post_to_instagram.py --limit 5
 """
-from __future__ import annotations
+
 import argparse
-import contextlib
-import io
+import csv
 import os
 import sys
-import tempfile
 import time
-import shutil
-import json
-from datetime import datetime, date
-from typing import Optional
+from datetime import datetime
+from typing import List, Dict
 
-import pandas as pd
-from PIL import Image
-
-try:
-    from instagrapi import Client
-    from instagrapi.exceptions import LoginRequired
-except Exception as e:
-    print("ERROR: instagrapi is not installed. Run: pip install instagrapi", file=sys.stderr)
-    raise
+import requests
 
 
-# ---------- Config ----------
-DEFAULT_CSV = "captions.csv"
-DEFAULT_IMAGES_DIR = "images"
-SESSION_FILE = ".ig_session.json"
-BACKUP_SUFFIX = ".bak"
-MAX_SIDE = 1350  # Instagram-friendly max pixel side
+GRAPH_FACEBOOK_BASE = "https://graph.facebook.com/v21.0"
+CSV_PATH = "captions.csv"
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Instagram CSV Poster (next-schedule mode)")
-    p.add_argument("--csv", default=DEFAULT_CSV, help="Path to CSV file")
-    p.add_argument("--images-dir", default=DEFAULT_IMAGES_DIR, help="Local images directory for filename lookups")
-    p.add_argument("--dry-run", action="store_true", help="Do everything except the actual upload")
-    p.add_argument("--limit", type=int, default=1, help="Max number of posts to attempt this run (default 1)")
-    p.add_argument("--all", action="store_true", help="Post ALL matching rows instead of just the next scheduled one(s)")
-    p.add_argument("--category", default=None, help="Filter by Category==value (case-insensitive)")
-    p.add_argument("--start-date", default=None, help="Only include rows with date >= this (YYYY-MM-DD)")
-    p.add_argument("--end-date", default=None, help="Only include rows with date <= this (YYYY-MM-DD)")
-    return p.parse_args()
+def get_env_var(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        print(f"ERROR: environment variable {name} is not set.", file=sys.stderr)
+        sys.exit(1)
+    return value
 
 
-def load_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, dtype=str, keep_default_na=False)
-    df.columns = [c.strip() for c in df.columns]
-
-    for col in ["posted", "caption"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    def is_falsey(v: str) -> bool:
-        v = (v or "").strip().lower()
-        return v in {"", "false", "0", "no", "n"}
-
-    df["_to_post"] = df["posted"].apply(is_falsey)
-
-    if "date" in df.columns:
-        with contextlib.suppress(Exception):
-            df["_date_parsed"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-    else:
-        df["_date_parsed"] = pd.NaT
-
-    return df
-
-
-def save_csv_atomically(df: pd.DataFrame, path: str) -> None:
-    if os.path.exists(path) and not os.path.exists(path + BACKUP_SUFFIX):
-        shutil.copy2(path, path + BACKUP_SUFFIX)
-
-    tmp_fd, tmp_path = tempfile.mkstemp(prefix="captions_", suffix=".csv")
-    os.close(tmp_fd)
-    try:
-        df.to_csv(tmp_path, index=False)
-        shutil.move(tmp_path, path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(tmp_path)
-
-
-def resolve_image_path(row: pd.Series, images_dir: str) -> tuple[str, bool]:
-    url = row.get("image_url", "").strip()
-    fn = row.get("filename", "").strip()
-
-    if url:
-        if url.lower().startswith(("http://", "https://")):
-            import urllib.request
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(url)[1] or ".jpg")
-            tmp.close()
-            urllib.request.urlretrieve(url, tmp.name)
-            return tmp.name, True
-        if os.path.isabs(url):
-            return url, False
-        return os.path.join(images_dir, url), False
-
-    if fn:
-        if os.path.isabs(fn):
-            return fn, False
-        return os.path.join(images_dir, fn), False
-
-    raise ValueError("Row is missing both image_url and filename")
-
-
-def prepare_image_for_instagram(path: str) -> str:
-    with Image.open(path) as im:
-        w, h = im.size
-        max_side = max(w, h)
-        if max_side <= MAX_SIDE:
-            return path
-        scale = MAX_SIDE / float(max_side)
-        new_size = (int(w * scale), int(h * scale))
-        out = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(path)[1] or ".jpg")
-        out_path = out.name
-        out.close()
-        im.resize(new_size, Image.LANCZOS).save(out_path, quality=95, optimize=True)
-        return out_path
-
-
-def get_client() -> Client:
-    username = os.getenv("IG_USERNAME")
-    password = os.getenv("IG_PASSWORD")
-    if not username or not password:
-        print("Please set IG_USERNAME and IG_PASSWORD environment variables.", file=sys.stderr)
+def load_rows(csv_path: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    if not os.path.exists(csv_path):
+        print(f"ERROR: CSV file '{csv_path}' not found.", file=sys.stderr)
         sys.exit(1)
 
-    cl = Client()
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        # Just sanity-check a couple of key headers
+        required = {"image_url", "caption", "posted"}
+        if not required.issubset(reader.fieldnames or []):
+            print(
+                f"ERROR: CSV must contain at least these columns: {', '.join(required)}",
+                file=sys.stderr,
+            )
+            print(f"Found columns: {reader.fieldnames}", file=sys.stderr)
+            sys.exit(1)
 
-    if os.path.exists(SESSION_FILE):
-        try:
-            cl.load_settings(SESSION_FILE)
-            cl.login(username, password)
-            return cl
-        except Exception:
-            pass
+        for row in reader:
+            rows.append(row)
 
-    cl.login(username, password)
-    with contextlib.suppress(Exception):
-        cl.dump_settings(SESSION_FILE)
-    return cl
-
-
-def normalize_caption(text: str) -> str:
-    text = (text or "").strip()
-    return text[:2200]
+    return rows
 
 
-def parse_date_or_none(s: Optional[str]) -> Optional[date]:
-    if not s:
-        return None
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        print(f"Warning: could not parse date '{s}', ignoring filter.")
-        return None
+def save_rows(csv_path: str, rows: List[Dict[str, str]]) -> None:
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    tmp_path = csv_path + ".tmp"
+
+    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    os.replace(tmp_path, csv_path)
 
 
-def pick_next_scheduled_rows(df: pd.DataFrame, limit: int) -> pd.DataFrame:
-    """Return up to `limit` rows representing the next scheduled unposted items.
-    Prefers future (≥ today), else falls back to earliest past.
-    If no date column, picks the first unposted rows by CSV order.
+def is_truthy(value: str) -> bool:
+    v = (value or "").strip().lower()
+    return v in ("1", "true", "yes", "y", "t")
+
+
+def is_falsy(value: str) -> bool:
+    v = (value or "").strip().lower()
+    return v in ("0", "false", "no", "n", "f")
+
+
+def row_is_pending(row: Dict[str, str]) -> bool:
+    posted = row.get("posted", "")
+    to_post_flag = row.get("_to_post", "")
+
+    # Already posted?
+    if is_truthy(posted):
+        return False
+
+    # Explicitly marked "do NOT post"?
+    if is_falsy(to_post_flag):
+        return False
+
+    # Otherwise, treat it as pending
+    return True
+
+
+def create_media_container(ig_user_id: str, access_token: str, image_url: str, caption: str) -> str:
     """
-    today = datetime.now().date()
-    base = df[df["_to_post"]].copy()
+    Step 1: Create a media container.
+    """
+    endpoint = f"{GRAPH_FACEBOOK_BASE}/{ig_user_id}/media"
+    params = {
+        "image_url": image_url,
+        "caption": caption,
+        "access_token": access_token,
+    }
 
-    if "_date_parsed" not in base.columns or base["_date_parsed"].isna().all():
-        return base.head(limit)
+    resp = requests.post(endpoint, params=params, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Error creating media container: {resp.status_code} {resp.text}"
+        )
 
-    fut = base[base["_date_parsed"] >= today].sort_values(["_date_parsed"]).head(limit)
-    if not fut.empty:
-        return fut
+    data = resp.json()
+    creation_id = data.get("id")
+    if not creation_id:
+        raise RuntimeError(f"No creation_id in response: {data}")
 
-    past = base[base["_date_parsed"] < today].sort_values(["_date_parsed"]).head(limit)
-    return past
+    return creation_id
 
 
-def main():
-    args = parse_args()
-    df = load_csv(args.csv)
+def wait_for_container_ready(creation_id: str, access_token: str,
+                             max_attempts: int = 10, delay: float = 2.0) -> None:
+    """
+    Poll the container status until it's FINISHED or we give up.
+    """
+    endpoint = f"{GRAPH_FACEBOOK_BASE}/{creation_id}"
+    params = {
+        "fields": "status_code",
+        "access_token": access_token,
+    }
 
-    # Global filter mask
-    mask = df["_to_post"]
+    for attempt in range(1, max_attempts + 1):
+        resp = requests.get(endpoint, params=params, timeout=30)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Error checking container status: {resp.status_code} {resp.text}"
+            )
+        data = resp.json()
+        status = data.get("status_code")
+        if status == "FINISHED":
+            return
+        elif status == "ERROR":
+            raise RuntimeError(f"Container {creation_id} ended in ERROR: {data}")
 
-    if args.category and "Category" in df.columns:
-        mask &= df["Category"].str.strip().str.lower().eq(args.category.strip().lower())
+        time.sleep(delay)
 
-    start_d = parse_date_or_none(args.start_date)
-    end_d = parse_date_or_none(args.end_date)
+    raise RuntimeError(
+        f"Container {creation_id} did not reach FINISHED after {max_attempts} attempts"
+    )
 
-    if start_d is not None and "_date_parsed" in df.columns:
-        mask &= df["_date_parsed"].apply(lambda d: (pd.notna(d) and d >= start_d))
-    if end_d is not None and "_date_parsed" in df.columns:
-        mask &= df["_date_parsed"].apply(lambda d: (pd.notna(d) and d <= end_d))
 
-    filtered = df[mask].copy()
+def publish_media(ig_user_id: str, access_token: str, creation_id: str) -> str:
+    """
+    Step 2: Publish the media container.
+    """
+    endpoint = f"{GRAPH_FACEBOOK_BASE}/{ig_user_id}/media_publish"
+    params = {
+        "creation_id": creation_id,
+        "access_token": access_token,
+    }
 
-    if filtered.empty:
-        print("No rows to post. (Either all are posted already or filters removed them.)")
+    resp = requests.post(endpoint, params=params, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Error publishing media: {resp.status_code} {resp.text}"
+        )
+
+    data = resp.json()
+    ig_media_id = data.get("id")
+    if not ig_media_id:
+        raise RuntimeError(f"No media id in response: {data}")
+
+    return ig_media_id
+
+
+def post_single_row(ig_user_id: str, access_token: str, row: Dict[str, str]) -> str:
+    """
+    Full flow for one row: create container -> wait -> publish.
+    """
+    image_url = row["image_url"]
+    caption = row.get("caption", "")
+
+    print(f"  • Creating media container for: {image_url}")
+    creation_id = create_media_container(ig_user_id, access_token, image_url, caption)
+
+    print(f"    Container created: {creation_id}, waiting to finish…")
+    wait_for_container_ready(creation_id, access_token)
+
+    print("    Publishing media…")
+    media_id = publish_media(ig_user_id, access_token, creation_id)
+    print(f"    ✅ Published! Media ID: {media_id}")
+    return media_id
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Post queued images to Instagram via Graph API (captions.csv).")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=1,
+        help="Maximum number of new posts to publish (default: 1)",
+    )
+    args = parser.parse_args()
+
+    ig_user_id = get_env_var("IG_USER_ID")
+    access_token = get_env_var("IG_ACCESS_TOKEN")
+
+    rows = load_rows(CSV_PATH)
+    pending_indices = [i for i, r in enumerate(rows) if row_is_pending(r)]
+
+    if not pending_indices:
+        print("No pending posts found in captions.csv (all either posted or _to_post is falsy).")
         return
 
-    if args.all:
-        candidates = filtered
-    else:
-        candidates = pick_next_scheduled_rows(filtered, limit=args.limit)
+    print(f"Found {len(pending_indices)} pending rows. Will publish up to {args.limit}.\n")
 
-    if candidates.empty:
-        print("No eligible 'next' rows found.")
-        return
+    posted_count = 0
+    now_iso = lambda: datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-    print(f"Found {len(candidates)} post(s) to process.")
+    for idx in pending_indices:
+        if posted_count >= args.limit:
+            break
 
-    cl = None
-    if not args.dry_run:
-        cl = get_client()
+        row = rows[idx]
+        print(f"Posting row #{idx + 1} (Post No.: {row.get('Post No.', '')})")
 
-    successes = 0
-
-    for idx, row in candidates.iterrows():
         try:
-            img_path, is_temp1 = resolve_image_path(row, args.images_dir)
-            prep_path = prepare_image_for_instagram(img_path)
-            caption = normalize_caption(row.get("caption", ""))
-
-            human_date = row.get("date", "")
-            print(f"\nPosting: {img_path}  (date={human_date})\nCaption: {caption[:80]}{'...' if len(caption)>80 else ''}")
-
-            if args.dry_run:
-                media_pk = "DRY_RUN"
-                print("[dry-run] Skipping upload.")
-            else:
-                media = cl.photo_upload(prep_path, caption)
-                media_pk = getattr(media, "pk", None) or ""
-                time.sleep(2)
-
-            df.at[idx, "posted"] = "TRUE"
-            df.at[idx, "posted_at"] = datetime.now().isoformat(timespec="seconds")
-            df.at[idx, "instagram_media_id"] = str(media_pk)
-            if "error" in df.columns:
-                df.at[idx, "error"] = ""
-            successes += 1
-
+            media_id = post_single_row(ig_user_id, access_token, row)
+            # Mark as posted
+            row["posted"] = "1"
+            row["posted_at"] = now_iso()
+            row["instagram_media_id"] = media_id
+            row["error"] = ""
+            posted_count += 1
+            print("")
         except Exception as e:
-            err = str(e)
-            print(f"ERROR posting row {idx}: {err}", file=sys.stderr)
-            if "error" not in df.columns:
-                df["error"] = ""
-            df.at[idx, "error"] = err
-        finally:
-            with contextlib.suppress(Exception):
-                if 'is_temp1' in locals() and is_temp1 and os.path.exists(img_path):
-                    os.remove(img_path)
-            with contextlib.suppress(Exception):
-                if 'prep_path' in locals() and prep_path not in (img_path,) and os.path.exists(prep_path):
-                    os.remove(prep_path)
+            msg = str(e)
+            print(f"    ❌ Failed to publish this row: {msg}", file=sys.stderr)
+            # Record the error but don't mark as posted
+            row["error"] = msg[:500]  # avoid insane length
 
-        save_csv_atomically(df, args.csv)
-
-    print(f"\nDone. Successfully processed {successes} post(s). CSV updated.")
+    save_rows(CSV_PATH, rows)
+    print(f"Done. Successfully published {posted_count} post(s).")
 
 
 if __name__ == "__main__":

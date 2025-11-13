@@ -1,0 +1,15 @@
+# Environment and credentials
+.env
+.ig_session.json
+
+# Virtual environment
+.venv/
+
+# Backups and cache
+__pycache__/
+*.bak
+*.tmp
+*.log
+
+# macOS metadata
+.DS_Store
