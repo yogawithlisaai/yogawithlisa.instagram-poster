@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/Users/lisa/Documents/GitHub/yogawithlisa.instagram-poster/post_to_instagram.py", line 31, in <module>
+    import requests
+ModuleNotFoundError: No module named 'requests'
